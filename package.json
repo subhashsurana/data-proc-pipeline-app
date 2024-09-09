@@ -24,6 +24,7 @@
     "@aws-cdk/aws-lambda-nodejs": "^1.32.2",
     "@types/aws-lambda": "^8.10.145",
     "aws-cdk-lib": "^2.155.0",
+    "aws-jwt-verify": "^4.0.1",
     "aws-sdk": "^2.1690.0",
     "constructs": "^10.0.0",
     "source-map-support": "^0.5.21",

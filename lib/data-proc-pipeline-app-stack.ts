@@ -9,11 +9,35 @@ import * as sns_subscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as path from 'path';
 import * as iam from 'aws-cdk-lib/aws-iam'; 
+import * as cognito from 'aws-cdk-lib/aws-cognito';
 
 
 export class DataProcPipelineAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
+
+    
+     // Create a Cognito User Pool
+     const userPool = new cognito.UserPool(this, 'MyUserPool', {
+      selfSignUpEnabled: true,          // Allow users to sign up on their own
+      signInAliases: { email: true, },  // Allow users to sign in with their email
+      autoVerify: { email: true, },     // Verify users' email addresses automatically
+      passwordPolicy: {
+        minLength: 8,
+        requireSymbols: false,
+      },
+    });
+
+    // Create an App Client for the User Pool (without a client secret)
+    const userPoolClient = new cognito.UserPoolClient(this, 'MyUserPoolClient', {
+      userPool,
+      generateSecret: false,       // Do not use a client secret for easier integration with API Gateway
+      authFlows: {
+        userPassword: true,       // Enable USER_PASSWORD_AUTH flow
+        adminUserPassword: true,  // Optionally enable admin-based password auth flow
+        userSrp: true
+      },
+    });
 
     // DynamoDB Table
     const table = new dynamodb.Table(this, 'ProcessedData', {
@@ -25,34 +49,33 @@ export class DataProcPipelineAppStack extends cdk.Stack {
     // Lambda Function for processing API Requests
     const lambdaFunction = new NodejsFunction(this, 'FileProcessor', {
       entry: path.join(__dirname, '../lambda/data-proc.ts'),  // Path to the TypeScript file
-      handler: 'handler',  // Exported handler function
-      runtime: lambda.Runtime.NODEJS_18_X,  // Ensure it's Node.js 14.x or higher for modern JavaScript/TypeScript
+      handler: 'handler',                                     // Exported handler function
+      runtime: lambda.Runtime.NODEJS_18_X,                    // Ensure it's Node.js 14.x or higher for modern JavaScript/TypeScript
       bundling: {
-        minify: true,  // Optional: Minify the code to reduce bundle size
-        nodeModules: ['aws-sdk','uuid'],  // Ensure `uuid` is included in the bundle
+        minify: true,                                         // Optional: Minify the code to reduce bundle size
+        nodeModules: ['aws-sdk','uuid'],                      // Ensure `uuid` is included in the bundle
       },
       environment: {
-        TABLE_NAME: table.tableName,  // Pass DynamoDB table name as an environment variable
+        TABLE_NAME: table.tableName,                          // Pass DynamoDB table name as an environment variable
       },
     });
 
-    // Lambda function for the REQUEST authorizer (validates x-api-key)
+    // Lambda function for the custom authorizer
     const authorizerLambda = new NodejsFunction(this, 'AuthorizerLambda', {
       runtime: lambda.Runtime.NODEJS_18_X,
-      handler: 'handler',  // Authorizer Lambda function handler
-      entry: path.join(__dirname, '../lambda/authorizer.ts'),  // Path to the authorizer Lambda code
+      handler: 'handler',                                     // Authorizer Lambda function handler
+      entry: path.join(__dirname, '../lambda/authorizer.ts'), // Path to the authorizer Lambda code
       bundling: {
-        minify: true,  // Optional: Minify the code to reduce bundle size
-        nodeModules: ['aws-sdk'],  // Ensure `uuid` is included in the bundle
+        minify: true,                                         // Optional: Minify the code to reduce bundle size
+        nodeModules: ['aws-sdk','aws-jwt-verify'],            // Ensure `uuid` is included in the bundle
+      },
+      environment: {
+        USERPOOL_ID: userPool.userPoolId,
+        CLIENT_ID: userPoolClient.userPoolClientId,
+        NODE_OPTIONS: '--enable-source-maps',
       },
     });
 
-    // Add the API Gateway permission to the Lambda's role
-    authorizerLambda.addToRolePolicy(new iam.PolicyStatement({
-      effect: iam.Effect.ALLOW,
-      actions: ['apigateway:GET'],
-      resources: ['arn:aws:apigateway:us-east-1::/apikeys/*'],  // Allow access to all API keys in the region
-    }));
 
     // Grant Lambda permission to write to DynamoDB
     table.grantWriteData(lambdaFunction);
@@ -62,34 +85,36 @@ export class DataProcPipelineAppStack extends cdk.Stack {
       restApiName: 'DataProcessingAPI',
       description: 'API for uploading text files and processing them',
       endpointTypes: [apigateway.EndpointType.REGIONAL],
-      binaryMediaTypes: ['text/plain'],  // Enable binary uploads (text files)
+      binaryMediaTypes: ['text/plain'],               // Enable binary uploads (text files)
       deployOptions: {
-        stageName: 'prod',  // Deploy to the 'prod' stage
+        stageName: 'prod',                            // Deploy to the 'prod' stage
+      },
+      defaultCorsPreflightOptions: {
+        allowOrigins: apigateway.Cors.ALL_ORIGINS,
+        allowMethods: apigateway.Cors.ALL_METHODS,
       },
     });
 
-    // REQUEST-based Lambda authorizer that validates the API key
-    const requestAuthorizer = new apigateway.RequestAuthorizer(this, 'RequestAuthorizer', {
-      handler: authorizerLambda,  // Use the authorizer Lambda function
-      identitySources: [apigateway.IdentitySource.header('x-api-key')],  // Validate API key from header
-      resultsCacheTtl: cdk.Duration.seconds(0),  // Optional: Cache for 5 minutes
+    // REQUEST-based Lambda authorizer that validates the Authorization from Header
+    const customAuthorizer = new apigateway.RequestAuthorizer(this, 'RequestAuthorizer', {
+      handler: authorizerLambda,                                              // Use the authorizer Lambda function
+      identitySources: [apigateway.IdentitySource.header('authorization')],   // Validate authorization from header
+      resultsCacheTtl: cdk.Duration.seconds(0),                               // Optional: No caching for development/testing
     });
 
 
     // Lambda Integration with API Gateway
-    
     const lambdaIntegration = new apigateway.LambdaIntegration(lambdaFunction);
      
      
-    // Attach the POST method with the RequestAuthorizer and API key requirement
-    const dataResource = api.root.addResource('app');
-    dataResource.addMethod('POST', lambdaIntegration, {    // Add POST method
-      apiKeyRequired: true,           // Require API Key for this method
-      authorizationType: apigateway.AuthorizationType.CUSTOM,   // Use custom authorizer
-      authorizer: requestAuthorizer,  // Attach the request-based Lambda authorize
+    // Attach the POST method with with Cognito Authorizer
+    const dataResource = api.root.addResource('dataproc');
+    dataResource.addMethod('POST', lambdaIntegration, {         // Add POST method
+      authorizationType: apigateway.AuthorizationType.CUSTOM,  // Use Cognito authorizer
+      authorizer: customAuthorizer,                            // Link the Cognito user pool to the authorizer
       methodResponses: [
         {
-          statusCode: '200',  // Successful response
+          statusCode: '200',                                   // Successful response
           responseParameters: {
             'method.response.header.Content-Type': true,
             'method.response.header.Access-Control-Allow-Origin': true,  // CORS header
@@ -97,40 +122,23 @@ export class DataProcPipelineAppStack extends cdk.Stack {
         },
       ]
     });
-    
-    // Create an API key (auto-generated)
-    const apiKey = api.addApiKey('DataProcApiKey', {
-      apiKeyName: 'DataProcAutoGenerateApiKey',  // Optional: Specify a name
+
+    // Output the User Pool and API information
+    new cdk.CfnOutput(this, 'UserPoolId', {
+      value: userPool.userPoolId,
+      description: 'The ID of the Cognito User Pool',
     });
 
-    // Create a usage plan and associate the API key
-    const usagePlan = api.addUsagePlan('UsagePlan', {
-      name: 'BasicUsagePlan',
-      throttle: {
-        rateLimit: 100,  // Limit of 100 requests per second
-        burstLimit: 200,  // Burst limit for rapid requests
-      },
-      quota: {
-        limit: 10000,  // 10,000 requests per month
-        period: apigateway.Period.MONTH,
-      },
+    new cdk.CfnOutput(this, 'UserPoolClientId', {
+      value: userPoolClient.userPoolClientId,
+      description: 'The ID of the Cognito User Pool Client',
     });
 
-    // Associate the API key with the usage plan
-    usagePlan.addApiKey(apiKey);
-
-    // Attach the usage plan to the API stage
-    usagePlan.addApiStage({
-      stage: api.deploymentStage,
-      api: api
+    new cdk.CfnOutput(this, 'ApiEndpoint', {
+      value: api.url + 'dataproc',
+      description: 'The API Gateway endpoint for the /dataproc resource',
     });
-    
-    // Output the API Key
-    new cdk.CfnOutput(this, 'ApiKeyOutput', {
-      value: apiKey.keyId,  // Outputs the API Key ID
-      description: 'The auto-generated API key',
-    });
-    
+       
     // Create an SNS topic for CloudWatch Alarms
     const snsTopic = new sns.Topic(this, 'AlarmTopic', {
       displayName: 'Lambda Alarm Topic',
@@ -144,13 +152,13 @@ export class DataProcPipelineAppStack extends cdk.Stack {
     // CloudWatch Invocation Errors Alarm
 
     const errorAlarm = new cloudwatch.Alarm(this, 'LambdaErrorAlarm', {
-      metric: lambdaFunction.metricErrors(),  // Metric for invocation errors
-      threshold: 1,  // Alarm when there is more than 1 error
-      evaluationPeriods: 1,  // How many evaluation periods before triggering the alarm
-      datapointsToAlarm: 1,  // Alarm as soon as it detects 1 error
+      metric: lambdaFunction.metricErrors(),        // Metric for invocation errors
+      threshold: 1,                                 // Alarm when there is more than 1 error
+      evaluationPeriods: 1,                         // How many evaluation periods before triggering the alarm
+      datapointsToAlarm: 1,                         // Alarm as soon as it detects 1 error
       alarmDescription: 'Alarm when the Lambda function returns an error',
       alarmName: 'LambdaInvocationErrorAlarm',
-      actionsEnabled: true,  // Enable actions when alarm triggers
+      actionsEnabled: true,                         // Enable actions when alarm triggers
     });
     
     // Add SNS notification to error alarm
@@ -161,9 +169,9 @@ export class DataProcPipelineAppStack extends cdk.Stack {
     // CloudWatch Duration Threshold Alarm
 
     const durationAlarm = new cloudwatch.Alarm(this, 'LambdaDurationAlarm', {
-      metric: lambdaFunction.metricDuration(),  // Metric for function duration
-      threshold: 5000,  // Duration in milliseconds (e.g., 5000 ms = 5 seconds)
-      evaluationPeriods: 1,  // Trigger the alarm after one period
+      metric: lambdaFunction.metricDuration(),       // Metric for function duration
+      threshold: 5000,                               // Duration in milliseconds (e.g., 5000 ms = 5 seconds)
+      evaluationPeriods: 1,                          // Trigger the alarm after one period
       datapointsToAlarm: 1,
       alarmDescription: 'Alarm when the Lambda function execution time exceeds 5 seconds',
       alarmName: 'LambdaDurationAlarm',
@@ -177,8 +185,8 @@ export class DataProcPipelineAppStack extends cdk.Stack {
     // CloudWatch Throttling Alarm
 
     const throttleAlarm = new cloudwatch.Alarm(this, 'LambdaThrottleAlarm', {
-      metric: lambdaFunction.metricThrottles(),  // Metric for throttling
-      threshold: 1,  // Alarm if throttling occurs
+      metric: lambdaFunction.metricThrottles(),     // Metric for throttling
+      threshold: 1,                                 // Alarm if throttling occurs
       evaluationPeriods: 1,
       datapointsToAlarm: 1,
       alarmDescription: 'Alarm when Lambda throttling occurs',
