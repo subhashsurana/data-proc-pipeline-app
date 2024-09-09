@@ -20,6 +20,9 @@ const processTextFile = (fileContent: string): { id: string; content: string }[]
 // Define Lambda handler
 export const handler = async (event: any): Promise<any> => {
   try {
+    console.log('Request received in Data Processing Lambda');
+    console.log('Event:', JSON.stringify(event, null, 2));
+
     // API Gateway sends the file as base64-encoded binary data in event.body
     const fileBuffer = Buffer.from(event.body, 'base64');
     const fileContent = fileBuffer.toString('utf-8'); // Convert buffer to string (text file)

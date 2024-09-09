@@ -7,8 +7,8 @@ import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as sns_subscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
-import * as path from 'path'; 
-import * as logs from 'aws-cdk-lib/aws-logs';
+import * as path from 'path';
+import * as iam from 'aws-cdk-lib/aws-iam'; 
 
 
 export class DataProcPipelineAppStack extends cdk.Stack {
@@ -22,7 +22,7 @@ export class DataProcPipelineAppStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,  // For dev/testing; use RETAIN for production
     });
 
-    // Lambda Function
+    // Lambda Function for processing API Requests
     const lambdaFunction = new NodejsFunction(this, 'FileProcessor', {
       entry: path.join(__dirname, '../lambda/data-proc.ts'),  // Path to the TypeScript file
       handler: 'handler',  // Exported handler function
@@ -36,21 +36,101 @@ export class DataProcPipelineAppStack extends cdk.Stack {
       },
     });
 
+    // Lambda function for the REQUEST authorizer (validates x-api-key)
+    const authorizerLambda = new NodejsFunction(this, 'AuthorizerLambda', {
+      runtime: lambda.Runtime.NODEJS_18_X,
+      handler: 'handler',  // Authorizer Lambda function handler
+      entry: path.join(__dirname, '../lambda/authorizer.ts'),  // Path to the authorizer Lambda code
+      bundling: {
+        minify: true,  // Optional: Minify the code to reduce bundle size
+        nodeModules: ['aws-sdk'],  // Ensure `uuid` is included in the bundle
+      },
+    });
+
+    // Add the API Gateway permission to the Lambda's role
+    authorizerLambda.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['apigateway:GET'],
+      resources: ['arn:aws:apigateway:us-east-1::/apikeys/*'],  // Allow access to all API keys in the region
+    }));
 
     // Grant Lambda permission to write to DynamoDB
     table.grantWriteData(lambdaFunction);
 
     // API Gateway to trigger Lambda
-    const api = new apigateway.RestApi(this, 'TextUploadAPI', {
-      restApiName: 'Text Upload Service',
+    const api = new apigateway.RestApi(this, 'DataProcessingAPI', {
+      restApiName: 'DataProcessingAPI',
       description: 'API for uploading text files and processing them',
+      endpointTypes: [apigateway.EndpointType.REGIONAL],
       binaryMediaTypes: ['text/plain'],  // Enable binary uploads (text files)
+      deployOptions: {
+        stageName: 'prod',  // Deploy to the 'prod' stage
+      },
     });
 
-    // Lambda Integration with API Gateway
-    const lambdaIntegration = new apigateway.LambdaIntegration(lambdaFunction);
-    api.root.addMethod('POST', lambdaIntegration);  // Add POST method
+    // REQUEST-based Lambda authorizer that validates the API key
+    const requestAuthorizer = new apigateway.RequestAuthorizer(this, 'RequestAuthorizer', {
+      handler: authorizerLambda,  // Use the authorizer Lambda function
+      identitySources: [apigateway.IdentitySource.header('x-api-key')],  // Validate API key from header
+      resultsCacheTtl: cdk.Duration.seconds(0),  // Optional: Cache for 5 minutes
+    });
 
+
+    // Lambda Integration with API Gateway
+    
+    const lambdaIntegration = new apigateway.LambdaIntegration(lambdaFunction);
+     
+     
+    // Attach the POST method with the RequestAuthorizer and API key requirement
+    const dataResource = api.root.addResource('app');
+    dataResource.addMethod('POST', lambdaIntegration, {    // Add POST method
+      apiKeyRequired: true,           // Require API Key for this method
+      authorizationType: apigateway.AuthorizationType.CUSTOM,   // Use custom authorizer
+      authorizer: requestAuthorizer,  // Attach the request-based Lambda authorize
+      methodResponses: [
+        {
+          statusCode: '200',  // Successful response
+          responseParameters: {
+            'method.response.header.Content-Type': true,
+            'method.response.header.Access-Control-Allow-Origin': true,  // CORS header
+          },
+        },
+      ]
+    });
+    
+    // Create an API key (auto-generated)
+    const apiKey = api.addApiKey('DataProcApiKey', {
+      apiKeyName: 'DataProcAutoGenerateApiKey',  // Optional: Specify a name
+    });
+
+    // Create a usage plan and associate the API key
+    const usagePlan = api.addUsagePlan('UsagePlan', {
+      name: 'BasicUsagePlan',
+      throttle: {
+        rateLimit: 100,  // Limit of 100 requests per second
+        burstLimit: 200,  // Burst limit for rapid requests
+      },
+      quota: {
+        limit: 10000,  // 10,000 requests per month
+        period: apigateway.Period.MONTH,
+      },
+    });
+
+    // Associate the API key with the usage plan
+    usagePlan.addApiKey(apiKey);
+
+    // Attach the usage plan to the API stage
+    usagePlan.addApiStage({
+      stage: api.deploymentStage,
+      api: api
+    });
+    
+    // Output the API Key
+    new cdk.CfnOutput(this, 'ApiKeyOutput', {
+      value: apiKey.keyId,  // Outputs the API Key ID
+      description: 'The auto-generated API key',
+    });
+    
     // Create an SNS topic for CloudWatch Alarms
     const snsTopic = new sns.Topic(this, 'AlarmTopic', {
       displayName: 'Lambda Alarm Topic',
