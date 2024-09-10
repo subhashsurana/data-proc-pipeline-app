@@ -10,7 +10,7 @@ import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as path from 'path';
 import * as iam from 'aws-cdk-lib/aws-iam'; 
 import * as cognito from 'aws-cdk-lib/aws-cognito';
-
+import * as logs from 'aws-cdk-lib/aws-logs';
 
 export class DataProcPipelineAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -44,7 +44,23 @@ export class DataProcPipelineAppStack extends cdk.Stack {
       partitionKey: { name: 'id', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.DESTROY,  // For dev/testing; use RETAIN for production
+//    encryption: dynamodb.TableEncryption.AWS_MANAGED
     });
+
+    // Create a custom IAM role with only PutItem permission for DynamoDB
+    const fileProcessorRole = new iam.Role(this, 'FileProcessorCustomRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),  // Lambda service principal
+    });
+
+    // Attach least privilege policy to the fileProcessorRole
+    fileProcessorRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:PutItem'],             // Only allow PutItem action
+      resources: [table.tableArn],               // Restrict access to the specific table
+    }));
+
+    // Allow the Lambda function to write logs to CloudWatch
+    fileProcessorRole.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'));
+
 
     // Lambda Function for processing API Requests
     const lambdaFunction = new NodejsFunction(this, 'FileProcessor', {
@@ -58,6 +74,7 @@ export class DataProcPipelineAppStack extends cdk.Stack {
       environment: {
         TABLE_NAME: table.tableName,                          // Pass DynamoDB table name as an environment variable
       },
+      role: fileProcessorRole
     });
 
     // Lambda function for the custom authorizer
@@ -78,8 +95,13 @@ export class DataProcPipelineAppStack extends cdk.Stack {
 
 
     // Grant Lambda permission to write to DynamoDB
-    table.grantWriteData(lambdaFunction);
+    // table.grantWriteData(lambdaFunction);  // commented since the custom IAM role fileProcessorRole are already attached to Lambda Function
 
+    const logGroup = new logs.LogGroup(this, 'LambdaLogGroup', {
+      retention: logs.RetentionDays.ONE_WEEK,
+    });
+
+    
     // API Gateway to trigger Lambda
     const api = new apigateway.RestApi(this, 'DataProcessingAPI', {
       restApiName: 'DataProcessingAPI',
@@ -87,7 +109,26 @@ export class DataProcPipelineAppStack extends cdk.Stack {
       endpointTypes: [apigateway.EndpointType.REGIONAL],
       binaryMediaTypes: ['text/plain'],               // Enable binary uploads (text files)
       deployOptions: {
-        stageName: 'prod',                            // Deploy to the 'prod' stage
+        stageName: 'prod',                                  // Deploy to the 'prod' stage
+        // loggingLevel: apigateway.MethodLoggingLevel.INFO,   // Enable logging
+        dataTraceEnabled: true,                             // Log full request/response data
+        metricsEnabled: true,                               // Enable CloudWatch metrics
+        throttlingRateLimit: 100,                           // 100 requests per second
+        throttlingBurstLimit: 200,                          // Burst limit for rapid requests
+
+      // // 👇 enable access logging to the log group we created above.        
+      //   accessLogDestination: new apigateway.LogGroupLogDestination(logGroup),  // 👈 enable access logging & send logs to the custom Log Group
+      //   accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields({    // Customize the log format
+      //     caller: false,
+      //     httpMethod: true,
+      //     ip: true,
+      //     protocol: true,
+      //     requestTime: true,
+      //     resourcePath: true,
+      //     responseLength: true,
+      //     status: true,
+      //     user: true,
+      //   }),  
       },
       defaultCorsPreflightOptions: {
         allowOrigins: apigateway.Cors.ALL_ORIGINS,
@@ -95,6 +136,7 @@ export class DataProcPipelineAppStack extends cdk.Stack {
       },
     });
 
+    
     // REQUEST-based Lambda authorizer that validates the Authorization from Header
     const customAuthorizer = new apigateway.RequestAuthorizer(this, 'RequestAuthorizer', {
       handler: authorizerLambda,                                              // Use the authorizer Lambda function
@@ -110,6 +152,7 @@ export class DataProcPipelineAppStack extends cdk.Stack {
     // Attach the POST method with with Cognito Authorizer
     const dataResource = api.root.addResource('dataproc');
     dataResource.addMethod('POST', lambdaIntegration, {         // Add POST method
+    // apiKeyRequired: true,                                     // Require API Key for this method
       authorizationType: apigateway.AuthorizationType.CUSTOM,  // Use Cognito authorizer
       authorizer: customAuthorizer,                            // Link the Cognito user pool to the authorizer
       methodResponses: [
@@ -122,6 +165,33 @@ export class DataProcPipelineAppStack extends cdk.Stack {
         },
       ]
     });
+
+    // // Create an API key (auto-generated)
+    // const apiKey = api.addApiKey('DataProcApiKey', {
+    //   apiKeyName: 'DataProcAutoGenApiKey',  // Optional: Specify a name
+    // });
+
+    // // Create a usage plan and associate the API key
+    // const usagePlan = api.addUsagePlan('UsagePlan', {
+    //   name: 'BasicUsagePlan',
+    //   throttle: {
+    //     rateLimit: 100,  // Limit of 100 requests per second
+    //     burstLimit: 200,  // Burst limit for rapid requests
+    //   },
+    //   quota: {
+    //     limit: 10000,  // 10,000 requests per month
+    //     period: apigateway.Period.MONTH,
+    //   },
+    // });
+
+    // // Associate the API key with the usage plan
+    // usagePlan.addApiKey(apiKey);
+
+    // // Attach the usage plan to the API stage
+    // usagePlan.addApiStage({
+    //   stage: api.deploymentStage,
+    // });
+
 
     // Output the User Pool and API information
     new cdk.CfnOutput(this, 'UserPoolId', {
@@ -138,7 +208,13 @@ export class DataProcPipelineAppStack extends cdk.Stack {
       value: api.url + 'dataproc',
       description: 'The API Gateway endpoint for the /dataproc resource',
     });
-       
+
+    // // Output the API Key
+    // new cdk.CfnOutput(this, 'ApiKeyOutput', {
+    // value: apiKey.keyId,  // Outputs the API Key ID
+    // description: 'The auto-generated API key',
+    // });
+      
     // Create an SNS topic for CloudWatch Alarms
     const snsTopic = new sns.Topic(this, 'AlarmTopic', {
       displayName: 'Lambda Alarm Topic',
