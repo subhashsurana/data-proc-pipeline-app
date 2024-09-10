@@ -44,7 +44,7 @@ export class DataProcPipelineAppStack extends cdk.Stack {
       partitionKey: { name: 'id', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.DESTROY,  // For dev/testing; use RETAIN for production
-//    encryption: dynamodb.TableEncryption.AWS_MANAGED
+      encryption: dynamodb.TableEncryption.AWS_MANAGED
     });
 
     // Create a custom IAM role with only PutItem permission for DynamoDB
@@ -93,9 +93,6 @@ export class DataProcPipelineAppStack extends cdk.Stack {
       },
     });
 
-
-    // Grant Lambda permission to write to DynamoDB
-    // table.grantWriteData(lambdaFunction);  // commented since the custom IAM role fileProcessorRole are already attached to Lambda Function
 
     const logGroup = new logs.LogGroup(this, 'LambdaLogGroup', {
       retention: logs.RetentionDays.ONE_WEEK,
